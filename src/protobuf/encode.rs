@@ -4,6 +4,7 @@ use chrono::Timelike;
 use prost::Message;
 use prost_reflect::{DynamicMessage, FieldDescriptor, Kind, MapKey, MessageDescriptor};
 use std::collections::HashMap;
+use tracing::warn;
 
 /// Convert a single raw `Value` into a protobuf `Value`.
 ///
@@ -171,14 +172,19 @@ pub fn encode_message(
         for field in message_descriptor.fields() {
             match map.get(field.name()) {
                 None | Some(Value::Null) => message.clear_field(&field),
-                Some(value) => message
-                    .try_set_field(
-                        &field,
-                        convert_value(&field, value.clone()).map_err(|e| {
-                            format!("Error converting {} field: {}", field.name(), e)
-                        })?,
-                    )
-                    .map_err(|e| format!("Error setting {} field: {}", field.name(), e))?,
+                Some(value) => {
+                    match convert_value(&field, value.clone())
+                        .map_err(|e| format!("Error converting {} field: {}", field.name(), e))
+                    {
+                        Err(e) => {
+                            warn!("Dropping field from proto: {}", e);
+                            message.clear_field(&field);
+                        }
+                        Ok(v) => message
+                            .try_set_field(&field, v)
+                            .map_err(|e| format!("Error setting {} field: {}", field.name(), e))?,
+                    }
+                }
             }
         }
         Ok(message)
@@ -550,5 +556,22 @@ mod tests {
         );
         let parsed_value = parsed_value.unwrap();
         assert_eq!(value, parsed_value)
+    }
+
+    #[test]
+    fn test_drop_fields_on_encode_proto() {
+        // We expect that the proto is encoded successfully and the record is not dropped
+        // However, we will drop the field that cannot be encoded successfully (number)
+        // Specifically, if we pass a string to a numeric field, we will expect that the parsing fails but the record is still successful
+        let message = encode_message(
+            &test_message_descriptor("Integers"),
+            Value::Object(BTreeMap::from([
+                ("i32".into(), Value::Bytes(Bytes::from("not_a_numeric"))),
+                ("i64".into(), Value::Bytes(Bytes::from("9876"))),
+            ])),
+        )
+        .unwrap();
+        assert_eq!(message.has_field_by_name("i32"), false); // Due to failed parsing, this field is cleared
+        assert_eq!(message.has_field_by_name("i64"), true);
     }
 }
